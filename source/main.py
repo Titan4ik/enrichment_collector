@@ -1,111 +1,13 @@
-import asyncio
-import asyncpg
+import db_helper
 from pprint import pprint
-import ast
-import define_data_type as DTF
-
-IS_LOG = True
-
-class Cache:
-    def __init__(self):
-        self._results = {}
-
-    async def execute(self, conn, table, param, value):
-        sql_request = f"SELECT * FROM {table} WHERE {param}='{value}'"
-        try:
-            return self._results[sql_request]
-        except KeyError:
-            res = await conn.fetch(sql_request)
-            await insert_into_select_request_log(table, param, str(value))
-            self._results[sql_request] = res
-            return res
-        
-            
-async def get_connection():
-
-    return await asyncpg.connect(user=user, password=password,
-                                 database=database, host=host)
-                                 
-def connection(sql_func):
-    async def wraper(*args, **kwargs):
-        conn = await get_connection()
-        try:
-            return await sql_func(conn, *args, **kwargs)
-        finally:
-            await conn.close()
-    return wraper
-
-@connection                              
-async def get_relationship(conn):
-    values = await conn.fetch('''SELECT * FROM relationship_in_tables''')
-    retval = {}
-    for value in values:
-        try:
-            retval[value['table1_name']].append([value['table2_name'], value['column_from_table1'], value['column_from_table2']])
-        except KeyError:
-            retval[value['table1_name']] = [[value['table2_name'], value['column_from_table1'], value['column_from_table2']]]
-        try:
-            retval[value['table2_name']].append([value['table1_name'], value['column_from_table2'], value['column_from_table1']])
-        except KeyError:
-            retval[value['table2_name']] = [[value['table1_name'], value['column_from_table2'], value['column_from_table1']]]
-    return retval
-
-@connection
-async def insert_into_select_request_log(conn, table, param, value):
-    if not IS_LOG:
-        return
-    await conn.execute(
-        "INSERT INTO select_request_log (table_name, column_name, column_value, request_time) "
-        "VALUES($1, $2, $3, current_timestamp)",
-        table, param, value
-    )
-
-@connection 
-async def get_info(conn, table_name, param_name, param_value):
-    tree = await get_relationship()
-    info = {}
-    paths = {}
-    current_tables = [(table_name,param_name,param_value)]
-    cache = Cache()
-    while current_tables:
-        table, param, value = current_tables.pop(0)
-        if table not in paths:
-            paths[table] = set()
-        try:
-            datas = await cache.execute(conn, table, param, value)
-            # datas = await conn.fetch(f"SELECT * FROM {table} WHERE {param}='{value}'")
-        except Exception as e:
-            continue
-        if not datas:
-            continue
-        try:
-            _ = info[table]
-        except Exception:
-            info[table] = set()
-        is_added = False
-        for data in datas:
-            if data not in info[table]:
-                is_added = True
-                info[table].add(data)
-        if not is_added:
-            continue
-        next_tables = tree.get(table)
-        if next_tables is None:
-            continue
-        for (next_table, prev_param, next_param) in next_tables:
-            if not(next_table in paths and table in paths[next_table]):
-                paths[table].add(next_table)
-            for data in datas:
-                current_tables.append(
-                    [next_table, next_param, data[prev_param]]
-                )
-    print(f'Был пройден следующий путь начиная с {table_name}')
-    pprint(paths)
-    return info
+from datetime import datetime
+from prettytable import PrettyTable
+import csv
+import json
 
 
-async def find_related_tables(table_name):
-    tree = await get_relationship()
+def find_related_tables(table_name):
+    tree = db_helper.get_relationship()
     related_tables = {table_name}
     current_tables = [table_name]
     while current_tables:
@@ -119,139 +21,125 @@ async def find_related_tables(table_name):
                 current_tables.append(next_table)
     return related_tables
 
-@connection
-async def get_tables(conn):
-    sql = (
-        "SELECT table_name, column_name, data_type "
-        "FROM information_schema.columns "
-        "WHERE table_schema='public' "
-        "order by table_name"
-    )
-    rows = await conn.fetch(sql)
-    tables = {}
-    ignore_tables = [
-        'relationship_in_tables', 'type_columns_in_tables'
-    ]
-    for row in rows:
-        if row['table_name'] in ignore_tables:
-            continue
-        try:
-            tables[row['table_name']].append([row['column_name'], row['data_type']])
-        except KeyError:
-            tables[row['table_name']] = [[row['column_name'], row['data_type']]]
-    return tables
 
-@connection
-async def analyze_relationship(conn, curr_table):
-    tables = await get_tables()
-    curr_columns = tables[curr_table]
-    del tables[curr_table]
-    for name, columns in tables.items():
-        for column in columns:
-            for curr_column in curr_columns:
-                if curr_column[1] == column[1]:
-                    similar_procent = await analyze_two_columns(curr_table, curr_column[0], name, column[0])
-                    if similar_procent:
-                        await insert_relationship(curr_table, curr_column[0], name, column[0], similar_procent)
-    sql = (
-        "SELECT table_name, column_name, column_type "
-        "FROM type_columns_in_tables "
-        f"WHERE column_type in (SELECT column_type FROM type_columns_in_tables WHERE table_name='{curr_table}')"
-    )
-    rows = await conn.fetch(sql)
-    curr_columns = {}
-    columns_type = {}
-    for row in rows:
-        if row['table_name'] == curr_table:
-            curr_columns[row['column_type']] = row['column_name']
-            continue
-        try:
-            columns_type[row['column_type']].append([row['table_name'], row['column_name']])
-        except KeyError:
-            columns_type[row['column_type']] = [[row['table_name'], row['column_name']]]
-        
-    for type_, column_name1 in curr_columns.items():
-        data = columns_type.get(type_)
-        if data is None:
-            continue
-        for table2, column_name2 in data:
-            await insert_relationship(curr_table, column_name1, table2, column_name2)
+def prepare():
+    db_helper.init_tables()
+    tables = db_helper.get_tables()
+    for table in tables:
+        db_helper.detect_column_type(table)
+    for table, columns in tables.items():
+        db_helper.analyze_relationship(tables, table, columns)
 
 
-@connection
-async def insert_relationship(conn, table1, column1, table2, column2, similar_procent=0):
-    rows = await conn.fetch(
-        "SELECT * FROM relationship_in_tables "
-        f"WHERE table1_name='{table2}' and column_from_table1='{column2}' and table2_name='{table1}' and column_from_table2='{column1}'"
-    )
-    if rows:
-        return
-    await conn.execute(
-        "INSERT INTO relationship_in_tables (table1_name, column_from_table1, table2_name, column_from_table2) "
-        "VALUES($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-        table1, column1, table2, column2
-    )
-    print(table1, column1, table2, column2, f"[similar = {similar_procent*100}%]")
-
-@connection
-async def analyze_two_columns(conn, table1, column1, table2, column2):
-    sql_full = (
-        f"SELECT {table1}.{column1} AS col1, {table2}.{column2} AS col2 "
-        f"FROM {table1} "
-        f"FULL JOIN {table2} "
-        f"ON {table1}.{column1}={table2}.{column2}"
-    )
-    res_full = await conn.fetch(sql_full)
-    sql_inner = sql_full.replace('FULL JOIN', 'INNER JOIN')
-    res_inner = await conn.fetch(sql_inner)
-    if len(res_full) > 0:
-        # print(res_full)
-        return len(res_inner) / len(res_full)
-
-
-
-@connection
-async def detect_column_type(conn, table):
-    rows = await conn.fetch(f'SELECT * FROM {table}')
-    types = {}
-    for row in rows:
-        for param_name, param_value in row.items():
-            param_value = str(param_value)
-            for assumption in DTF.detect_type(param_value):
-                try:
-                    types[param_name][assumption] += 1
-                except KeyError:
-                    types[param_name] = {assumption: 1}
-    pprint(types)
-    for column, types in types.items():
-        for type_name in types:
-            await insert_type_columns_in_tables(table, column, type_name)
-
-@connection
-async def insert_type_columns_in_tables(conn, table, column, type_name):
-    await conn.execute(
-        "INSERT INTO type_columns_in_tables(table_name, column_name, column_type) VALUES($1, $2, $3) ON CONFLICT DO NOTHING",
-        table, column, type_name
-    )
-
-async def prepare():
-    for table in await get_tables():
-        await detect_column_type(table)
-    for table in await get_tables():
-        await analyze_relationship(table)
-
-async def main():
-    # await prepare()
+def main():
+    
     print(f"Найденная информация")
-    pprint(await get_info('vk_posts', 'post_url', 'url1'))
-    # table_name = 'peoples'
-    # print(f'Связанные таблицы для {table_name}')
-    # pprint(await find_related_tables(table_name))
-    # print('Список всех таблиц')
-    # pprint(await get_tables())
-    
-    
+    # pprint(get_info("vk_posts", "post_url", "url1"))
+    table_name = "address_and_payment_of_inspections"
+    # print(f"Связанные таблицы для {table_name}")
+    # pprint(find_related_tables(table_name))
+    print("Список всех таблиц")
+    pprint(db_helper.get_tables())
 
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main())
+# def insert_test_data():
+#     db_helper.insert_data_in_table(
+#         "peoples",
+#         ["name", "telephone", "email", "date_of_birth"],
+#         [
+#             ("aleks", "79992254552", "sasha@mail.ru", datetime(1998, 4, 29)),
+#             ("vasya", "79992254444", "vasya@mail.ru", datetime(1998, 6, 26)),
+#             ("katya", "79992254441", "katya@mail.ru", datetime(1998, 8, 19)),
+#             ("lena", "79992253333", "lena@mail.ru", datetime(1998, 1, 9)),
+#         ],
+#     )
+#     db_helper.insert_data_in_table(
+#         "user_in_social",
+#         ["telephone", "facebook_id", "vk_id"],
+#         [
+#             ("79992254552", 0, 0),
+#             ("79992254444", 1, 1),
+#             ("79992254441", 3, 10),
+#             ("79992253333", 4, 222),
+#         ],
+#     )
+#     db_helper.insert_data_in_table(
+#         "vk_posts",
+#         ["vk_id", "post_url"],
+#         [
+#             (0, "url1"),
+#             (0, "url2"),
+#             (0, "url3"),
+#             (0, "url5"),
+#             (1, "url11"),
+#             (1, "url12"),
+#             (1, "url13"),
+#             (1, "url15"),
+#             (5, "url131"),
+#             (5, "url151"),
+#             (3, "url1312"),
+#             (3, "url1512"),
+#         ],
+#     )
+#     db_helper.insert_data_in_table(
+#         "mail",
+#         ["email_from", "email_to", "msg"],
+#         [
+#             ("sasha@mail.ru", "vasya@mail.ru", "hello"),
+#             ("vasya@mail.ru", "sasha@mail.ru", "hello"),
+#             ("sasha@mail.ru", "vasya@mail.ru", "go in dota2"),
+#             ("vasya@mail.ru", "sasha@mail.ru", "go"),
+#             ("hehi@mail.ru", "don@mail.ru", "go in weesssese"),
+#             ("don@mail.ru", "katya@mail.ru", "go"),
+#         ],
+#     )
+
+
+def load_csv(path_to_file: str):
+    with open(path_to_file, "r", newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=';', quotechar='|')
+        header = None
+        rows = []
+        for line in reader:
+            if header is None:
+                header = line
+            else:
+                rows.append(line)
+    return header, rows
+
+
+def load_data_from_csv(table_name: str, path_to_file: str):
+    header, rows = load_csv(path_to_file)
+    db_helper.insert_data_in_table(table_name, rows)
+
+def print_table(table_name, header, rows):
+    columns = len(header)
+    table = PrettyTable(header)
+    td_data = rows[:]
+    for row in rows:
+        table.add_row(row)
+    with open(f'{table_name}.txt', 'w', encoding='utf-8') as f:
+        f.writelines(table.get_string())
+    print(table) 
+
+def load_schema(schema_name):
+    with open(f'.\schema_for_enrichment_table\{schema_name}.json') as json_file:
+        data = json.load(json_file)
+    db_helper.insert_info_about_table(
+        data['table_name'],
+        data['schema'],
+    )
+
+
+if __name__ == "__main__":
+    prepare()
+
+    # insert_test_data
+    # print_table(*load_csv('1.csv'))
+    # print_table(*load_csv('2.csv'))
+    # print_table('structure',*load_csv('3.csv'))
+    # print_table('data',*load_csv('4.csv'))
+    db_helper.delete_table('address_and_payment_of_inspections')
+    load_schema('address_and_payment_of_inspections')
+    load_data_from_csv('address_and_payment_of_inspections', '4.csv')
+    main()
